@@ -11,8 +11,10 @@ use rustc_middle::ty;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::DefId;
 use rustc_span::Span;
+use std::cell::RefCell;
 use std::cmp::min;
 use std::vec::Vec;
+
 //use crate::rap_info;
 
 #[derive(PartialEq, Debug, Copy, Clone)]
@@ -67,6 +69,10 @@ pub struct BlockNode<'tcx> {
     pub const_value: Vec<(usize, usize)>,
     //store switch stmts in current block for the path filtering in path-sensitive analysis.
     pub switch_stmts: Vec<Terminator<'tcx>>,
+
+    pub modified_value: FxHashSet<usize>,
+    // (SwitchInt target, enum index) -> outside nodes.
+    pub scc_outer: RefCell<Option<FxHashMap<(usize, usize), Vec<usize>>>>,
 }
 
 impl<'tcx> BlockNode<'tcx> {
@@ -81,6 +87,8 @@ impl<'tcx> BlockNode<'tcx> {
             scc_sub_blocks: Vec::<usize>::new(),
             const_value: Vec::<(usize, usize)>::new(),
             switch_stmts: Vec::<Terminator<'tcx>>::new(),
+            modified_value: FxHashSet::<usize>::default(),
+            scc_outer: RefCell::new(None),
         }
     }
 
@@ -165,6 +173,8 @@ pub struct SafeDropGraph<'tcx> {
     pub visit_times: usize,
     // analysis of heap item
     pub adt_owner: AdtOwner,
+
+    pub child_scc: FxHashMap<usize, Vec<BlockNode<'tcx>>>,
 }
 
 impl<'tcx> SafeDropGraph<'tcx> {
@@ -210,6 +220,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 if let StatementKind::Assign(ref assign) = stmt.kind {
                     let lv_local = assign.0.local.as_usize(); // assign.0 is a Place
                     let lv = assign.0.clone();
+                    cur_bb.modified_value.insert(lv_local);
                     match assign.1 {
                         // assign.1 is a Rvalue
                         Rvalue::Use(ref x) => {
@@ -471,6 +482,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
             bug_records: BugRecords::new(),
             visit_times: 0,
             adt_owner,
+            child_scc: FxHashMap::default(),
         }
     }
 
@@ -499,8 +511,14 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 }
             }
         }
+
+        let mut modified_set = FxHashSet::<usize>::default();
+        let mut switch_target = Vec::new();
+        
         // generate SCC
         if dfn[index] == low[index] {
+            let mut scc_block_set = FxHashSet::<usize>::default();
+            let init_block = self.blocks[index].clone();
             loop {
                 let node = stack.pop().unwrap();
                 self.scc_indices[node] = index;
@@ -510,11 +528,87 @@ impl<'tcx> SafeDropGraph<'tcx> {
                     break;
                 }
                 self.blocks[index].scc_sub_blocks.push(node);
+                scc_block_set.insert(node);
+
+                for value in &self.blocks[index].modified_value {
+                    modified_set.insert(*value);
+                }
+                if let Some(target) = self.switch_target(self.tcx, node) {
+                    switch_target.push((target, self.blocks[index].switch_stmts[0].clone()));
+                }
+
                 let nexts = self.blocks[node].next.clone();
                 for i in nexts {
                     self.blocks[index].next.insert(i);
                 }
             }
+
+            switch_target.retain(|v| !modified_set.contains(&(v.0)));
+            
+            if !switch_target.is_empty() && switch_target.len() == 1 {
+                //let target_index = switch_target[0].0;
+                let target_terminator = switch_target[0].1.clone();
+
+                let TerminatorKind::SwitchInt {
+                    discr: _,
+                    targets,
+                }  = target_terminator.kind else {
+                    unreachable!();
+                };
+
+                let mut sub_sccs = Vec::new();
+                for enum_index in targets.all_targets() {
+                    let mut block_node = init_block.clone();
+                    let mut work_list = Vec::new();
+                    let mut work_set = FxHashSet::<usize>::default();
+                    work_list.push(index);
+                    work_set.insert(index);
+                    while !work_list.is_empty() {
+                        let current_node = work_list.pop().unwrap();
+                        block_node.scc_sub_blocks.push(current_node);
+                        if current_node != index {
+                            if self.blocks[current_node].switch_stmts.is_empty() {
+                                for next in &self.blocks[current_node].next {
+                                    block_node.next.insert(*next);
+                                }
+                            } else {
+                                block_node.next.insert(enum_index.index());
+                            }
+                        }
+                        
+                        if self.blocks[current_node].switch_stmts.is_empty() {
+                            for next in &self.blocks[current_node].next {
+                                if scc_block_set.contains(next) && !work_set.contains(next) {
+                                    work_set.insert(*next);
+                                    work_list.push(*next);
+                                }
+                            }
+                        } else {
+                            let next_index = enum_index.index();
+                            if scc_block_set.contains(&next_index) && !work_set.contains(&next_index) {
+                                work_set.insert(next_index);
+                                work_list.push(next_index);
+                            }
+                        }
+                    }
+
+                    /* remove next nodes which are already in the current SCC */
+                    let mut to_remove = Vec::new();
+                    for i in block_node.next.iter() {
+                        if self.scc_indices[*i] == index {
+                            to_remove.push(*i);
+                        }
+                    }
+                    for i in to_remove {
+                        block_node.next.remove(&i);
+                    }
+
+                    sub_sccs.push(block_node);
+                }
+
+                self.child_scc.insert(index, sub_sccs);
+            }
+
             /* remove next nodes which are already in the current SCC */
             let mut to_remove = Vec::new();
             for i in self.blocks[index].next.iter() {
@@ -568,5 +662,29 @@ impl<'tcx> SafeDropGraph<'tcx> {
         self.dfs_on_spanning_tree(0, &mut stack, &mut paths);
 
         paths
+    }
+
+    pub fn switch_target(&mut self, tcx: TyCtxt<'tcx>, block_index: usize) -> Option<usize> {
+        let block = &self.blocks[block_index];
+        if block.switch_stmts.is_empty() {
+            return None;
+        }
+
+        let res = if let TerminatorKind::SwitchInt {
+            ref discr,
+            ref targets,
+        } = &block.switch_stmts[0].kind {
+            match discr {
+                Operand::Copy(p) | Operand::Move(p) => {
+                    let place = self.projection(tcx, false, p.clone());
+                    Some(place)
+                },
+                _ => None
+            }
+        } else {
+            None
+        };
+
+        res
     }
 }

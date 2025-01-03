@@ -81,6 +81,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
         self.values = backup_values;
         self.constant = backup_constant;
     }
+    
     pub fn split_check_with_cond(
         &mut self,
         bb_index: usize,
@@ -110,6 +111,43 @@ impl<'tcx> SafeDropGraph<'tcx> {
         self.alias_bb(self.scc_indices[bb_index], tcx);
         self.alias_bbcall(self.scc_indices[bb_index], tcx, fn_map);
         self.drop_check(self.scc_indices[bb_index], tcx);
+
+        if self.child_scc.get(&self.scc_indices[bb_index]).is_some() {
+            let sub_sccs = self.child_scc.get(&self.scc_indices[bb_index]).unwrap().clone();
+            for node in sub_sccs {
+                let backup_values = self.values.clone(); 
+                let backup_constant = self.constant.clone();
+
+                for i in node.scc_sub_blocks.clone() {
+                    self.alias_bb(i, tcx);
+                    self.alias_bbcall(i, tcx, fn_map);
+                    self.drop_check(i, tcx);
+                }
+                /* Reach a leaf node, check bugs */
+                match node.next.len() {
+                    0 => {
+                        // check the bugs.
+                        if Self::should_check(self.def_id) {
+                            self.dp_check(&cur_block);
+                        }
+                        return;
+                    }
+                    _ => {
+                        /*
+                        * Equivalent to self.check(cur_block.next[0]..);
+                        * We cannot use [0] for FxHashSet.
+                        */
+                        for next in node.next {
+                            self.check(next, tcx, fn_map);
+                        }
+                    }
+                }
+
+                self.values = backup_values;
+                self.constant = backup_constant;
+            }
+            return;
+        }
 
         /* Handle cases if the current block is a merged scc block with sub block */
         if cur_block.scc_sub_blocks.len() > 0 {
