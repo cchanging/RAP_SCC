@@ -174,7 +174,7 @@ pub struct SafeDropGraph<'tcx> {
     // analysis of heap item
     pub adt_owner: AdtOwner,
 
-    pub child_scc: FxHashMap<usize, Vec<BlockNode<'tcx>>>,
+    pub child_scc: FxHashMap<usize, (BlockNode<'tcx>, rustc_middle::mir::SwitchTargets, FxHashSet<usize>)>,
 }
 
 impl<'tcx> SafeDropGraph<'tcx> {
@@ -511,12 +511,11 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 }
             }
         }
-
-        let mut modified_set = FxHashSet::<usize>::default();
-        let mut switch_target = Vec::new();
         
         // generate SCC
         if dfn[index] == low[index] {
+            let mut modified_set = FxHashSet::<usize>::default();
+            let mut switch_target = Vec::new();
             let mut scc_block_set = FxHashSet::<usize>::default();
             let init_block = self.blocks[index].clone();
             loop {
@@ -542,7 +541,6 @@ impl<'tcx> SafeDropGraph<'tcx> {
                     self.blocks[index].next.insert(i);
                 }
             }
-
             switch_target.retain(|v| !modified_set.contains(&(v.0)));
             
             if !switch_target.is_empty() && switch_target.len() == 1 {
@@ -556,57 +554,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
                     unreachable!();
                 };
 
-                let mut sub_sccs = Vec::new();
-                for enum_index in targets.all_targets() {
-                    let mut block_node = init_block.clone();
-                    let mut work_list = Vec::new();
-                    let mut work_set = FxHashSet::<usize>::default();
-                    work_list.push(index);
-                    work_set.insert(index);
-                    while !work_list.is_empty() {
-                        let current_node = work_list.pop().unwrap();
-                        block_node.scc_sub_blocks.push(current_node);
-                        if current_node != index {
-                            if self.blocks[current_node].switch_stmts.is_empty() {
-                                for next in &self.blocks[current_node].next {
-                                    block_node.next.insert(*next);
-                                }
-                            } else {
-                                block_node.next.insert(enum_index.index());
-                            }
-                        }
-                        
-                        if self.blocks[current_node].switch_stmts.is_empty() {
-                            for next in &self.blocks[current_node].next {
-                                if scc_block_set.contains(next) && !work_set.contains(next) {
-                                    work_set.insert(*next);
-                                    work_list.push(*next);
-                                }
-                            }
-                        } else {
-                            let next_index = enum_index.index();
-                            if scc_block_set.contains(&next_index) && !work_set.contains(&next_index) {
-                                work_set.insert(next_index);
-                                work_list.push(next_index);
-                            }
-                        }
-                    }
-
-                    /* remove next nodes which are already in the current SCC */
-                    let mut to_remove = Vec::new();
-                    for i in block_node.next.iter() {
-                        if self.scc_indices[*i] == index {
-                            to_remove.push(*i);
-                        }
-                    }
-                    for i in to_remove {
-                        block_node.next.remove(&i);
-                    }
-
-                    sub_sccs.push(block_node);
-                }
-
-                self.child_scc.insert(index, sub_sccs);
+                self.child_scc.insert(index, (init_block, targets, scc_block_set));
             }
 
             /* remove next nodes which are already in the current SCC */
