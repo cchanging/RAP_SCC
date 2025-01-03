@@ -77,10 +77,14 @@ impl<'tcx> SafeDropGraph<'tcx> {
         /* duplicate the status before visiting a path; */
         let backup_values = self.values.clone(); // duplicate the status when visiting different paths;
         let backup_constant = self.constant.clone();
+        let backup_alias_set = self.alias_set.clone();
+        let backup_dead = self.dead_record.clone();
         self.check(bb_index, tcx, fn_map);
         /* restore after visit */
         self.values = backup_values;
         self.constant = backup_constant;
+        self.alias_set = backup_alias_set;
+        self.dead_record = backup_dead;
     }
     
     pub fn split_check_with_cond(
@@ -94,12 +98,16 @@ impl<'tcx> SafeDropGraph<'tcx> {
         /* duplicate the status before visiting a path; */
         let backup_values = self.values.clone(); // duplicate the status when visiting different paths;
         let backup_constant = self.constant.clone();
+        let backup_alias_set = self.alias_set.clone();
+        let backup_dead = self.dead_record.clone();
         /* add control-sensitive indicator to the path status */
         self.constant.insert(path_discr_id, path_discr_val);
         self.check(bb_index, tcx, fn_map);
         /* restore after visit */
         self.values = backup_values;
         self.constant = backup_constant;
+        self.alias_set = backup_alias_set;
+        self.dead_record = backup_dead;
     }
 
     // the core function of the safedrop.
@@ -296,12 +304,12 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 match discr {
                     Copy(p) | Move(p) => {
                         let place = self.projection(tcx, false, p.clone());
-                        if let Some(constant) = self.constant.get(&self.values[place].alias[0]) {
+                        if let Some(constant) = self.constant.get(&self.values[place].index) {
                             single_target = true;
                             sw_val = *constant;
                         }
-                        if self.values[place].alias[0] != place {
-                            path_discr_id = self.values[place].alias[0];
+                        if self.values[place].index != place {
+                            path_discr_id = self.values[place].index;
                             sw_targets = Some(targets.clone());
                         }
                     }

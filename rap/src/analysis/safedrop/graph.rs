@@ -106,7 +106,6 @@ pub struct ValueNode {
     pub kind: TyKind,
     pub father: usize,
     pub field_id: usize, // the field id of its father node.
-    pub alias: Vec<usize>,
     pub birth: isize,
     pub fields: FxHashMap<usize, usize>,
 }
@@ -119,7 +118,6 @@ impl ValueNode {
             need_drop: need_drop,
             father: local,
             field_id: usize::MAX,
-            alias: vec![index],
             birth: 0,
             may_drop: may_drop,
             kind: TyKind::Adt,
@@ -171,6 +169,8 @@ pub struct SafeDropGraph<'tcx> {
     pub bug_records: BugRecords,
     // a threhold to avoid path explosion.
     pub visit_times: usize,
+    pub alias_set: Vec<usize>,
+    pub dead_record: Vec<bool>,
     // analysis of heap item
     pub adt_owner: AdtOwner,
 
@@ -188,6 +188,8 @@ impl<'tcx> SafeDropGraph<'tcx> {
         let locals = &body.local_decls;
         let arg_size = body.arg_count;
         let mut values = Vec::<ValueNode>::new();
+        let mut alias = Vec::<usize>::new();
+        let mut dead = Vec::<bool>::new();
         let param_env = tcx.param_env(def_id);
         for (local, local_decl) in locals.iter_enumerated() {
             let need_drop = local_decl.ty.needs_drop(tcx, param_env); // the type is drop
@@ -199,6 +201,8 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 need_drop || may_drop,
             );
             node.kind = kind(local_decl.ty);
+            alias.push(values.len());
+            dead.push(false);
             values.push(node);
         }
 
@@ -284,6 +288,8 @@ impl<'tcx> SafeDropGraph<'tcx> {
                                 lvl0.birth = values[lv_local].birth;
                                 lvl0.field_id = 0;
                                 values[lv_local].fields.insert(0, lvl0.index);
+                                alias.push(values.len());
+                                dead.push(false);
                                 values.push(lvl0);
                             }
                             match x {
@@ -481,6 +487,8 @@ impl<'tcx> SafeDropGraph<'tcx> {
             return_set: FxHashSet::default(),
             bug_records: BugRecords::new(),
             visit_times: 0,
+            alias_set: alias,
+            dead_record: dead,
             adt_owner,
             child_scc: FxHashMap::default(),
         }
